@@ -17,29 +17,82 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch GdeBenz data
+
+      - name: Fetch source snapshots
         shell: bash
         run: |
-          mkdir -p data
-          URL='https://www.gdebenz.ru/api/stations?lat1=56.17&lon1=43.30&lat2=56.32&lon2=43.58'
-          curl --fail --location --silent --show-error --max-time 25             -A 'Mozilla/5.0 BenzRadar/1.0'             -H 'Accept: application/json'             "$URL" -o data/stations.tmp
+          mkdir -p data/raw
+          curl --fail --location --silent --show-error --max-time 25 \
+            -A 'Mozilla/5.0 BenzRadar/2.0' -H 'Accept: application/json' \
+            'https://www.gdebenz.ru/api/stations?lat1=56.17&lon1=43.30&lat2=56.32&lon2=43.58' \
+            -o data/raw/gdebenz.json || true
+          curl --fail --location --silent --show-error --max-time 25 \
+            -A 'Mozilla/5.0 BenzRadar/2.0' -H 'Accept: text/html' \
+            'https://esttoplivo.ru/city/dzerzhinsk' \
+            -o data/raw/esttoplivo.html || true
+
+      - name: Build BenzRadar aggregate
+        shell: bash
+        run: |
           python - <<'PY'
-          import json, pathlib
-          p=pathlib.Path("data/stations.tmp")
-          raw=p.read_text(encoding="utf-8")
-          obj=json.loads(raw)
+          import json, pathlib, re
+          from datetime import datetime, timezone
+
+          out={"fetched_at":datetime.now(timezone.utc).isoformat(),"sources":{},"stations":[],"events":[]}
+
+          p=pathlib.Path("data/raw/gdebenz.json")
+          if p.exists():
+              try:
+                  rows=json.loads(p.read_text(encoding="utf-8"))
+                  out["sources"]["gdebenz"]={"ok":True,"stations":len(rows)}
+                  for s in rows:
+                      out["stations"].append({
+                          "source":"gdebenz","source_id":s.get("osm_id"),
+                          "name":s.get("name") or s.get("brand") or "АЗС",
+                          "brand":s.get("brand") or s.get("name") or "",
+                          "address":s.get("addr") or s.get("address") or "",
+                          "lat":s.get("lat"),"lon":s.get("lon"),
+                          "status":s.get("status"),"fuels_now":s.get("fuels_now") or "",
+                          "prices_now":s.get("prices_now") or {},"raw_meta":s.get("meta") or {}
+                      })
+              except Exception as e:
+                  out["sources"]["gdebenz"]={"ok":False,"error":str(e)}
+          else: out["sources"]["gdebenz"]={"ok":False,"error":"fetch failed"}
+
+          p=pathlib.Path("data/raw/esttoplivo.html")
+          if p.exists():
+              html=p.read_text(encoding="utf-8",errors="ignore")
+              text=re.sub(r'<[^>]+>',' ',html)
+              text=re.sub(r'\s+',' ',text)
+              m=re.search(r'(\d+)\s+АЗС',text)
+              r=re.search(r'(\d+)\s+(?:свежих\s+)?отч',text,re.I)
+              out["sources"]["esttoplivo"]={
+                  "ok":True,"stations":int(m.group(1)) if m else None,
+                  "reports_today":int(r.group(1)) if r else None,
+                  "events_imported":0,
+                  "note":"City snapshot connected; structured event extraction activates when fresh reports are present."
+              }
+              # Conservative extraction: never invent a fresh event from undated page text.
+              # Recognise event vocabulary for future snapshots/history.
+              for kind,label in [("truck","бензовоз на АЗС"),("pause","перерыв")]:
+                  if label in text.lower():
+                      out["sources"]["esttoplivo"]["has_"+kind+"_mentions"]=True
+          else: out["sources"]["esttoplivo"]={"ok":False,"error":"fetch failed"}
+
+          pathlib.Path("data/aggregate.json").write_text(
+              json.dumps(out,ensure_ascii=False,separators=(",",":")),encoding="utf-8")
+          # backwards compatibility while frontend migrates
           pathlib.Path("data/stations.json").write_text(
-              json.dumps(obj, ensure_ascii=False, separators=(",",":")),
-              encoding="utf-8"
-          )
-          print("JSON OK; bytes:", len(raw))
+              json.dumps([s for s in out["stations"] if s["source"]=="gdebenz"],
+                         ensure_ascii=False,separators=(",",":")),encoding="utf-8")
+          print(json.dumps(out["sources"],ensure_ascii=False))
           PY
-          rm -f data/stations.tmp
+
       - name: Commit fresh data
         run: |
           git config user.name "benzradar-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add data/stations.json
+          git add data/aggregate.json data/stations.json
           git diff --cached --quiet && exit 0
-          git commit -m "Update live fuel data"
+          git commit -m "Update multi-source fuel data"
           git push
